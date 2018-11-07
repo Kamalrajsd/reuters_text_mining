@@ -7,6 +7,16 @@ from trie import Trie
 import time
 from nltk.stem import WordNetLemmatizer
 import contractions
+import csv
+import pandas as pd
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer, TfidfTransformer
+from sklearn.model_selection import train_test_split
+from sklearn.feature_selection import mutual_info_classif
+from sklearn.svm import LinearSVC   
+from sklearn.naive_bayes import MultinomialNB
+from sklearn.model_selection import cross_val_score
+from sklearn.linear_model import LogisticRegression
 
 class ReuterDataMiner:
     obj_lemmatizer = WordNetLemmatizer()
@@ -24,6 +34,17 @@ class ReuterDataMiner:
         self.obj_Trie = Trie()
         # stores the distinct words
         self.arr_words = set()
+
+        # topics classifier
+        obj_cls_topics = None
+        # places classifier
+        obj_cls_places = None
+        
+        # places vectorizer
+        obj_tfidf_places = None
+
+        # topics vectorizer
+        obj_tfidf_topics = None
      
     
     def doPreprocessing(self, b_is_verbose):
@@ -33,6 +54,13 @@ class ReuterDataMiner:
             str_flag (str): flag to enable logging.
         """
         file_count = 1
+
+        f_places = open(PATH_PRED_PLACES_CSV, 'w', newline='')
+        f_topics = open(PATH_PRED_TOPICS_CSV, 'w', newline='')
+        f_labeled = open(PATH_LABELED_CSV, 'w', newline='')
+        f_places_writer = csv.writer(f_places, quotechar='"', quoting=csv.QUOTE_ALL)
+        f_topics_writer = csv.writer(f_topics, quotechar='"', quoting=csv.QUOTE_ALL)
+        f_labeled_writer = csv.writer(f_labeled, quotechar='"', quoting=csv.QUOTE_ALL)
         
         # iterates through the list of data files
         for str_file_name in os.listdir(PATH_DATA_DIR):
@@ -61,30 +89,49 @@ class ReuterDataMiner:
                 # appends the distinct topics in the file to a dictionary of global distinct topics
                 self.dict_topics = { **self.dict_topics, **self._computeDistElement(obj_xml_data, XPATH_TOPICS) }
 
-                # clean the data to perform selection and transformation 
-                str_body_content = self._doCleanSymbols(obj_xml_data)
+                arr_f_places = []
+                arr_f_topics = []
+                arr_f_labeled = []
                 
-                str_body_content = self._expandAbbreviation(str_body_content)
+                for obj_elem in  obj_xml_data.findall("REUTERS"):
+                    
+                    # clean the data to perform selection and transformation 
+                    str_body_content, str_title_content = self._doCleanSymbols(obj_elem)
+                    
+                    str_body_content = self._expandAbbreviation(str_body_content)
+
+                    arr_places = [p.text for p in obj_elem.findall('PLACES//D')]
+                    
+                    arr_topics = [t.text for t in obj_elem.findall('TOPICS//D')]
+
+                    str_doc_id = obj_elem.attrib['NEWID']
+
+                    if len(arr_places) == 0:
+                        arr_f_places.append([str_doc_id, str_body_content, str_title_content])
+                    if len(arr_topics) == 0:
+                        arr_f_topics.append([str_doc_id, str_body_content, str_title_content])
+                    if len(arr_places) != 0 or len(arr_topics) != 0:
+                        for str_place in arr_places:
+                            arr_f_labeled.append([str_doc_id, str_place, CLASS_SEP.join(arr_places), EMPTY_STRING, EMPTY_STRING, str_body_content, str_title_content])
+                        for str_topics in arr_topics:
+                            arr_f_labeled.append([str_doc_id, EMPTY_STRING, EMPTY_STRING, str_topics, CLASS_SEP.join(arr_topics), str_body_content, str_title_content])
+                        
+
+                    # construct the trie
+                    self._populateTrie(str_body_content, str_doc_id) 
                 
-                # construct the trie
-                self._populateTrie(str_body_content)  
+                f_labeled_writer.writerows(arr_f_labeled)
+                f_places_writer.writerows(arr_f_places)
+                f_topics_writer.writerows(arr_f_topics) 
 
             if b_is_verbose:
                 print("Processed file: " + str(file_count))
             file_count += 1
+        f_topics.close()
+        f_labeled.close()
+        f_places.close()
 
-    def _doCleanSymbols(self, obj_xml_data):
-        """
-        Removes symbols & unicode characters that are not of interest
-        Args:
-            obj_xml_data (obj): object mapped XML data
-        """
-        str_body_content = ''
-
-        # extract content from all articles in a file
-        for obj_elem in  obj_xml_data.findall(XPATH_BODY):
-            str_body_content += obj_elem.text
-
+    def _doCleanText(self, str_body_content):
         # transform contractions to full version of the word
         # eg. I'm to I am; Could've to Could have   
         str_body_content = contractions.fix(str_body_content)
@@ -118,6 +165,30 @@ class ReuterDataMiner:
 
         return str_body_content
 
+    def _doCleanSymbols(self, obj_xml_data):
+        """
+        Removes symbols & unicode characters that are not of interest
+        Args:
+            obj_xml_data (obj): object mapped XML data
+        """
+        str_body_content = ''
+
+        # extract content from all articles in a file
+        for obj_elem in  obj_xml_data.findall(XPATH_TITLE):
+            str_body_content += obj_elem.text
+
+        str_title = self._doCleanText(str_body_content)
+
+        for obj_elem in  obj_xml_data.findall(XPATH_BODY):
+            str_body_content += obj_elem.text
+        if str_body_content == '' and obj_xml_data.find('TEXT').text is not None and obj_xml_data.find('TEXT').text != '':
+            str_body_content += obj_xml_data.find('TEXT').text
+        
+        str_body =  self._doCleanText(str_body_content)
+
+        return str_body, str_title
+        
+
     def _expandAbbreviation(self, str_body_content):
         """
         Replaces common abbreviations with expanded words
@@ -130,7 +201,8 @@ class ReuterDataMiner:
             'pct': 'percent',
             'cts': 'cent',
             'shr': 'share',
-            'U S ': ' usa ',
+            'u s ': ' usa ',
+            'u k ': ' uk ',
             'vs': 'versus',
             'mths': 'month',
             'avg':'average'
@@ -140,7 +212,7 @@ class ReuterDataMiner:
             str_body_content = re.sub(abb, dict_abbreviations[abb], str_body_content)
         return str_body_content
 
-    def _populateTrie(self, str_body_content):
+    def _populateTrie(self, str_body_content, str_doc_num):
         """
         Lemmatizes the word to add the it to Trie
         Args:
@@ -174,7 +246,7 @@ class ReuterDataMiner:
                 arr_clean_words.append(str_lemm)
                 
                 # insert the word into Trie
-                self.obj_Trie.insertWord(str_lemm)
+                self.obj_Trie.insertWord(str_doc_num, str_lemm)
 
         # add the distinct words from the file to the global set of distince words
         self.arr_words = self.arr_words.union(set(arr_clean_words))
@@ -252,7 +324,7 @@ class ReuterDataMiner:
         # sorts the keys in the dictionary
         arr_keys = list(dict.keys())
         arr_keys.sort()
-        with open(str_file_name, 'w') as f:
+        with open(PATH_OUTPUT_DIR +  str_file_name, 'w') as f:
             # writes each key to the file
             for key in arr_keys:
                 f.write(key + '\n')
@@ -267,12 +339,13 @@ class ReuterDataMiner:
         # fetches the list of distinct words
         self.arr_words = list(self.arr_words)
         self.arr_words.sort()
-        f = open(str_file_name, 'w')
+        f = open(PATH_OUTPUT_DIR + str_file_name, 'w')
 
         # fetches its word count from Trie and
         # writes it to the file
         for w in self.arr_words:
-            f.write(w+ " : " + str(self.obj_Trie.getWordCount(w)) + '\n')
+            wc, dc = self.obj_Trie.getWordCount(w)
+            f.write(w+ " : " + str(wc) + ", " + str(dc) + '\n')
 
     def getNoDataCount(self, str_flag):
         """
@@ -287,28 +360,138 @@ class ReuterDataMiner:
         else:
             raise BaseException('Invalid flag:' + str_flag)
 
+    def trainModel(self):
+        """
+        Trains Topics & places classifier based using TfIdf as the feature vector
+        """
+
+        # reads labled data
+        obj_df = pd.read_csv(PATH_LABELED_CSV, header=None, names=['id', 'places', 'all_places', 'topics', 'all_topics', 'body', 'title'])
+
+        # constructs Topics classifier
+        self.obj_tfidf_topics = TfidfVectorizer(sublinear_tf=True, min_df=5, norm='l2', ngram_range=(1, 2), stop_words='english')
+
+        obj_df_topics = obj_df.dropna(subset=['topics'])
+
+        obj_df_feat_topics_train, obj_df_feat_topics_test, obj_df_label_topics_train, obj_df_label_topics_test = train_test_split(obj_df_topics[['body', 'title']], obj_df_topics[['topics', 'all_topics']], test_size = 0.25)
+        
+        # construct tf-idf matrix
+        obj_tfidf_topics_train = self.obj_tfidf_topics.fit_transform(obj_df_feat_topics_train['body'])
+
+        # obj_mi_cv = CountVectorizer(max_df=0.95, min_df=2,
+        #                              max_features=10000,
+        #                              stop_words='english')
+        # mi_vector = cv.fit_transform(obj_df_feat_topics_train['title'])
+
+        # mi_feature_vector = mutual_info_classif(mi_vector, obj_df_label_topics_train['topics'], discrete_features=True)
+
+        self.obj_cls_topics = LinearSVC().fit(obj_tfidf_topics_train, obj_df_label_topics_train['topics'])
+
+        obj_tfidf_topics_test = self.obj_tfidf_topics.transform(obj_df_feat_topics_test['body'])
+
+
+        arr_predictions_topics = self.obj_cls_topics.predict(obj_tfidf_topics_test)
+
+        print(self.accuracy(arr_predictions_topics, obj_df_label_topics_test['all_topics']))
+
+        # constructs Topics classifier
+        self.obj_tfidf_places = TfidfVectorizer(sublinear_tf=True, min_df=5, norm='l2', ngram_range=(1, 2), stop_words='english')
+        obj_df_places = obj_df.dropna(subset=['places'])
+
+        obj_df_feat_places_train, obj_df_feat_places_test, obj_df_label_places_train, obj_df_label_places_test = train_test_split(obj_df_places[['body', 'title']], obj_df_places[['places', 'all_places']], test_size = 0.3)
+        
+        # construct tf-idf matrix
+        obj_tfidf_places_train = self.obj_tfidf_places.fit_transform(obj_df_feat_places_train['body'])
+
+        self.obj_cls_places = LinearSVC().fit(obj_tfidf_places_train, obj_df_label_places_train['places'])
+
+        obj_tfidf_places_test = self.obj_tfidf_places.transform(obj_df_feat_places_test['body'])
+
+        arr_predictions_places = self.obj_cls_places.predict(obj_tfidf_places_test)
+
+        print(self.accuracy(arr_predictions_places, obj_df_label_places_test['all_places']))
+
+        # cross-validation score
+        # accuracies = cross_val_score(clf, features, labels, scoring='accuracy', cv=5)
+        # for fold_idx, accuracy in enumerate(accuracies):
+        #     entries.append(('L_SV', fold_idx, accuracy))
+
+    def predict(self, str_flag):
+        """
+        Predicts the class based on the classifier requested 
+        Args:
+            str_flag   (str): classifier - topics/places
+        """
+        obj_cls = None
+        str_in_file_path = '' 
+        str_out_file_path = ''
+        obj_tfidf_vectorizer = None
+
+        if str_flag == 'topics':
+            obj_cls = self.obj_cls_topics
+            str_in_file_path = PATH_PRED_TOPICS_CSV
+            str_out_file_path = PATH_OUT_TOPICS_CSV
+            obj_tfidf_vectorizer = self.obj_tfidf_topics
+        elif str_flag == 'places':
+            obj_cls = self.obj_cls_places
+            str_in_file_path = PATH_PRED_PLACES_CSV
+            str_out_file_path = PATH_OUT_PLACES_CSV
+            obj_tfidf_vectorizer = self.obj_tfidf_places
+        else:
+            raise BaseException('Invalid flag: '+ str_flag)
+
+        obj_df_to_predict = pd.read_csv(str_in_file_path, header=None, names=['id', 'body', 'title'])        
+
+        obj_df_to_predict['predicted_'+str_flag] = obj_cls.predict(obj_tfidf_vectorizer.transform(obj_df_to_predict['body']))
+
+        obj_df_to_predict[['id', 'predicted_'+str_flag]].to_csv(str_out_file_path, index = False)
+
+        
+    def accuracy(self, predicted, class_set):
+        """
+        Computes the accuracy of the predicted data on test data 
+        Args:
+            predicted   (list): list containing predicted class lables
+            class_set   (list): list containing the possible classes for the data
+        """
+        class_set = list(class_set)
+        if len(predicted) != len(class_set):
+            raise BaseException('Length not equal')
+        right_pred  = 0
+        for i, c in enumerate(predicted):
+            if c in class_set[i]:
+                right_pred += 1
+        # print(str(right_pred)+ ' ' + str(len(predicted)) )
+        return right_pred/ len(predicted)
+
+
 # initialize the program
 obj_mine = ReuterDataMiner()
 
 start_time = time.time()
 # perform preprocessing 
 # set b_is_verbose to False if no status on preprocessing is needed
-obj_mine.doPreprocessing(b_is_verbose = True)
+# obj_mine.doPreprocessing(b_is_verbose = True)
 
-# write distinct places to a file
-obj_mine.writeDistinctToFile('places', 'places.txt')
+# trains the classifiers
+obj_mine.trainModel()
 
-# write distince topic to a file
-obj_mine.writeDistinctToFile('topics', 'topics.txt')
+obj_mine.predict("places")
+obj_mine.predict("topics")
+# # write distinct places to a file
+# obj_mine.writeDistinctToFile('places', 'places.txt')
 
-# write baseline wordcount to a file
-obj_mine.writeWordCountToFile('output.txt')
+# # write distince topic to a file
+# obj_mine.writeDistinctToFile('topics', 'topics.txt')
 
-# print articles with no places to the screen
-print(obj_mine.getNoDataCount('places'))
+# # write baseline wordcount to a file
+# obj_mine.writeWordCountToFile('output.txt')
 
-# print articles with no topics to the screen
-print(obj_mine.getNoDataCount('topics'))
+# # print articles with no places to the screen
+# print("No of articles with no places" + str((obj_mine.getNoDataCount('places'))))
+
+# # print articles with no topics to the screen
+# print("No of articles with no topics"+ str(obj_mine.getNoDataCount('topics')))
 
 print("--- %s seconds ---" % (time.time() - start_time))
 
